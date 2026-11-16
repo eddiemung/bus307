@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="zh-HK">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>307 實時巴士</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  html,body{margin:0;height:100%;font-family:-apple-system,system-ui,"PingFang HK",sans-serif}
+  #map{position:absolute;inset:0}
+  #panel{position:absolute;z-index:1000;left:10px;right:10px;bottom:16px;max-width:380px;
+    background:#fff;border-radius:14px;box-shadow:0 4px 18px rgba(0,0,0,.25);padding:12px 14px;font-size:14px}
+  #panel h1{font-size:17px;margin:0 0 4px;display:flex;align-items:center;gap:8px}
+  .badge{background:#d32f2f;color:#fff;border-radius:6px;padding:1px 7px;font-weight:700}
+  #status{color:#666;font-size:12px;margin-bottom:6px}
+  .legend{display:flex;gap:12px;font-size:12px;margin-bottom:6px}
+  .dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:4px;vertical-align:middle}
+  #eta{max-height:120px;overflow:auto}
+  #eta div{display:flex;justify-content:space-between;padding:2px 0;border-top:1px solid #eee}
+  .bus{width:26px;height:26px;border-radius:50%;color:#fff;font:700 10px/26px sans-serif;text-align:center;
+    border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.5)}
+  .hosp{width:14px;height:14px;border-radius:3px;background:#d32f2f;color:#fff;font:700 11px/14px sans-serif;text-align:center;border:2px solid #fff}
+  .note{color:#888;font-size:11px;margin-top:6px}
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="panel">
+  <h1><span class="badge">307</span> 實時巴士位置</h1>
+  <div id="status">載入中…</div>
+  <div class="legend">
+    <span><span class="dot" style="background:#1565c0"></span>Outbound</span>
+    <span><span class="dot" style="background:#e65100"></span>Inbound</span>
+    <span><span class="dot" style="background:#d32f2f;border-radius:2px"></span>Barnet Hospital</span>
+  </div>
+  <b>🏥 Barnet Hospital 到站時間</b>
+  <div id="eta">—</div>
+  <div class="note">位置係按 TfL 到站預測推算出嚟，唔係 GPS，大約準確到一個站左右。每 20 秒更新。</div>
+</div>
+<script>
+const LINE = '307', API = 'https://api.tfl.gov.uk', REFRESH_MS = 20000;
+const COLORS = { outbound: '#1565c0', inbound: '#e65100' };
+
+const map = L.map('map', { zoomControl: false }).setView([51.65, -0.16], 13);
+L.control.zoom({ position: 'topright' }).addTo(map);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  maxZoom: 19, attribution: '&copy; OpenStreetMap contributors | Data: TfL'
+}).addTo(map);
+
+const routes = {};            // dir -> { stops: [...], idx: Map(naptanId -> index) }
+const busMarkers = new Map(); // vehicleId -> marker
+const statusEl = document.getElementById('status');
+const etaEl = document.getElementById('eta');
+
+async function getJSON(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  return r.json();
+}
+
+// Flatten TfL lineString JSON into arrays of [lat, lon] polylines
+function toPolylines(arr) {
+  if (!Array.isArray(arr)) return [];
+  if (arr.length && typeof arr[0][0] === 'number') return [arr.map(([lon, lat]) => [lat, lon])];
+  return arr.flatMap(toPolylines);
+}
+
+async function loadRoute(dir) {
+  const d = await getJSON(`${API}/Line/${LINE}/Route/Sequence/${dir}`);
+  const bounds = [];
+  (d.lineStrings || []).forEach(s => {
+    toPolylines(JSON.parse(s)).forEach(pl => {
+      L.polyline(pl, { color: COLORS[dir], weight: 4, opacity: 0.55 }).addTo(map);
+      bounds.push(...pl);
+    });
+  });
+
+  const byId = new Map();
+  (d.stopPointSequences || []).forEach(seq => seq.stopPoint.forEach(sp => {
+    const s = { id: sp.id, name: sp.name, lat: sp.lat, lon: sp.lon };
+    byId.set(sp.id, s);
+    if (sp.stationId) byId.set(sp.stationId, s);
+  }));
+
+  let order = [];
+  const olr = (d.orderedLineRoutes || []).slice().sort((a, b) => b.naptanIds.length - a.naptanIds.length)[0];
+  if (olr) order = olr.naptanIds.map(id => byId.get(id)).filter(Boolean);
+  if (!order.length && d.stopPointSequences && d.stopPointSequences[0])
+    order = d.stopPointSequences[0].stopPoint.map(sp => byId.get(sp.id));
+
+  const idx = new Map();
+  order.forEach((s, i) => idx.set(s.id, i));
+  // also index stops on branches not in the longest ordered route
+  byId.forEach(s => { if (!idx.has(s.id)) idx.set(s.id, -1); });
+
+  order.forEach(s => {
+    const hosp = /barnet hospital/i.test(s.name);
+    if (hosp) {
+      L.marker([s.lat, s.lon], { icon: L.divIcon({ className: '', html: '<div class="hosp">H</div>', iconSize: [18, 18] }) })
+        .bindPopup('🏥 ' + s.name).addTo(map);
+    } else {
+      L.circleMarker([s.lat, s.lon], { radius: 3, color: COLORS[dir], weight: 1, fillOpacity: 1 })
+        .bindPopup(s.name).addTo(map);
+    }
+  });
+
+  routes[dir] = { stops: order, byId, idx };
+  return bounds;
+}
+
+function lerp(a, b, t) { return [a.lat + (b.lat - a.lat) * t, a.lon + (b.lon - a.lon) * t]; }
+
+function estimatePosition(preds) {
+  preds.sort((a, b) => a.timeToStation - b.timeToStation);
+  const next = preds[0];
+  const dirs = [next.direction, next.direction === 'outbound' ? 'inbound' : 'outbound'];
+  for (const dir of dirs) {
+    const r = routes[dir];
+    if (!r) continue;
+    const i = r.idx.get(next.naptanId);
+    if (i === undefined) continue;
+    const nextStop = r.byId.get(next.naptanId);
+    if (i <= 0) return { pos: [nextStop.lat, nextStop.lon], dir, nextStop };
+    const prevStop = r.stops[i - 1];
+    // Estimate segment travel time from the gap to the following stop, default 90s
+    let T = 90;
+    const after = preds.find(p => r.idx.get(p.naptanId) === i + 1);
+    if (after) T = Math.max(30, after.timeToStation - next.timeToStation);
+    const frac = Math.min(1, Math.max(0, 1 - next.timeToStation / T));
+    return { pos: lerp(prevStop, nextStop, frac), dir, nextStop };
+  }
+  return null;
+}
+
+function animateTo(marker, target) {
+  const start = marker.getLatLng(), t0 = performance.now(), dur = 1500;
+  function step(now) {
+    const k = Math.min(1, (now - t0) / dur);
+    marker.setLatLng([start.lat + (target[0] - start.lat) * k, start.lng + (target[1] - start.lng) * k]);
+    if (k < 1) requestAnimationFrame(step);
+  }
+  requestAnimationFrame(step);
+}
+
+async function refresh() {
+  try {
+    const arrivals = await getJSON(`${API}/Line/${LINE}/Arrivals`);
+    const byVehicle = new Map();
+    arrivals.forEach(a => {
+      if (!byVehicle.has(a.vehicleId)) byVehicle.set(a.vehicleId, []);
+      byVehicle.get(a.vehicleId).push(a);
+    });
+
+    const seen = new Set();
+    byVehicle.forEach((preds, vid) => {
+      const est = estimatePosition(preds);
+      if (!est) return;
+      seen.add(vid);
+      const next = preds[0];
+      const mins = Math.round(next.timeToStation / 60);
+      const popup = `<b>${vid}</b><br>往 ${next.destinationName || ''}<br>下一站：${est.nextStop.name}<br>約 ${mins <= 0 ? '即將到達' : mins + ' 分鐘'}`;
+      const icon = L.divIcon({ className: '', html: `<div class="bus" style="background:${COLORS[est.dir]}">307</div>`, iconSize: [30, 30] });
+      let m = busMarkers.get(vid);
+      if (!m) {
+        m = L.marker(est.pos, { icon, zIndexOffset: 1000 }).bindPopup(popup).addTo(map);
+        busMarkers.set(vid, m);
+      } else {
+        m.setIcon(icon); m.setPopupContent(popup); animateTo(m, est.pos);
+      }
+    });
+    busMarkers.forEach((m, vid) => { if (!seen.has(vid)) { map.removeLayer(m); busMarkers.delete(vid); } });
+
+    // Barnet Hospital ETAs
+    const hosp = arrivals.filter(a => /barnet hospital/i.test(a.stationName || ''))
+      .sort((a, b) => a.timeToStation - b.timeToStation).slice(0, 8);
+    etaEl.innerHTML = hosp.length ? hosp.map(a => {
+      const m = Math.round(a.timeToStation / 60);
+      return `<div><span>往 ${a.destinationName}</span><b>${m <= 0 ? '即將到達' : m + ' 分鐘'}</b></div>`;
+    }).join('') : '暫時冇預測（可能已收車）';
+
+    statusEl.textContent = `${seen.size} 架巴士行緊 · 更新於 ${new Date().toLocaleTimeString('en-GB')}`;
+  } catch (e) {
+    statusEl.textContent = '更新失敗：' + e.message + '（會自動再試）';
+  }
+}
+
+(async () => {
+  try {
+    const b = (await Promise.all(['outbound', 'inbound'].map(loadRoute))).flat();
+    if (b.length) map.fitBounds(b, { padding: [20, 20] });
+  } catch (e) {
+    statusEl.textContent = '載入路線失敗：' + e.message;
+  }
+  await refresh();
+  setInterval(refresh, REFRESH_MS);
+})();
+</script>
+</body>
+</html>
